@@ -98,13 +98,13 @@ void loadSettings() {
     // Sformatuj partycję NVS
     esp_err_t err = nvs_flash_erase();
     if (err != ESP_OK && Serial) {
-      if (Serial) Serial.printf("Błąd krytyczny: nie można sformatować NVS: %s\n", esp_err_to_name(err));
+      Serial.printf("Błąd krytyczny: nie można sformatować NVS: %s\n", esp_err_to_name(err));
     }
 
     // Zainicjuj sformatowaną partycję
     err = nvs_flash_init();
     if (err != ESP_OK && Serial) {
-      if (Serial) Serial.printf("Błąd krytyczny: nie można zainicjowac NVS: %s\n", esp_err_to_name(err));
+      Serial.printf("Błąd krytyczny: nie można zainicjowac NVS: %s\n", esp_err_to_name(err));
     }
     
     if (Serial) Serial.println("Formatowanie NVS zakończone. Zapisuję wartości domyślne.");

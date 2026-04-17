@@ -48,7 +48,23 @@ Zegar został zaprojektowany z myślą o bezawaryjnej pracy ciągłej przez deka
 4. Zegar zrestartuje się, podłączy do sieci, pobierze czas, a wbudowana dioda LED wskaże stan działania urządzenia.
 5. Wpisz adres IP zegara w swojej domowej przeglądarce, aby uzyskać dostęp do mapy i ustawień astro.
 
-## 🚥 Wskaźnik LED (Diagnostyka)
+## 🔐 Aktualizacje OTA (Over-The-Air)
+
+Urządzenie obsługuje wygodne i bezprzewodowe aktualizacje oprogramowania (OTA) z poziomu przeglądarki internetowej. Aby zapobiec nieautoryzowanym zmianom oprogramowania, dostęp do panelu aktualizacji jest zabezpieczony uwierzytelnianiem.
+
+**Domyślne dane logowania:**
+* **Użytkownik:** `admin`
+* **Hasło:** `astro123`
+
+> **⚠️ Ważne:** Ze względów bezpieczeństwa, przed wdrożeniem urządzenia zaleca się bezwzględną zmianę domyślnego hasła. Możesz to zrobić, edytując zmienne `ota_user` i `ota_pass` w pliku `src/main.cpp`.
+
+### Jak wykonać aktualizację?
+1. Skompiluj projekt (np. w PlatformIO), aby uzyskać plik `.bin` z nowym oprogramowaniem.
+2. Otwórz przeglądarkę internetową i przejdź pod adres: `http://<adres_IP_urządzenia>/update`.
+3. W oknie logowania podaj powyższą nazwę użytkownika oraz hasło.
+4. Wybierz skompilowany plik `.bin` ze swojego dysku, a następnie kliknij przycisk aktualizacji. Po udanym procesie urządzenie zrestartuje się automatycznie.
+
+## � Wskaźnik LED (Diagnostyka)
 Wbudowana dioda LED informuje o statusie systemu:
 * **Szybkie miganie (5Hz):** Tryb AP (Portal konfiguracyjny) - Oczekuje na konfigurację Wi-Fi.
 * **Miganie (2Hz):** Brak połączenia z Wi-Fi.

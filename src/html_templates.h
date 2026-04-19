@@ -182,7 +182,10 @@ footer{border-top:1px solid var(--bd);padding:22px 16px;text-align:center;color:
   </div>
 </div>
 
-<footer>&copy; 2026 Piotr Rużański</footer>
+<footer>
+  &copy; 2026 Piotr Rużański<br>
+  <span style="display:inline-block;margin-top:6px;font-size:11px;opacity:0.7;">Czas pracy: {{UPTIME}} &nbsp;|&nbsp; Rekord: {{REC_UPTIME}}</span>
+</footer>
 
 <script>
 if(document.getElementById('pst').textContent.indexOf('WYSOKI')>=0)

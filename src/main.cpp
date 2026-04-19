@@ -11,6 +11,7 @@
 #include <esp_system.h> // Do obsługi shutdown handler
 #include <esp_task_wdt.h> // Do obsługi sprzętowego watchdoga
 #include <Update.h> // Dodano do obsługi OTA
+#include <esp_timer.h> // Do precyzyjnego liczenia uptime (odporne na przepełnienie po 49 dniach)
 #include <inttypes.h> // Do przenośnego formatowania uint32_t
 #include "html_templates.h"
 
@@ -50,6 +51,7 @@ bool settingsDirty = false; // Flaga "brudnych" ustawień do rzadkiego zapisu
 unsigned long lastSaveTime = 0; // Czas ostatniego zapisu do NVS
 bool g_timeIsFromNVS = false; // Flaga informująca, czy czas został przywrócony z NVS
 uint32_t bootCount = 0; // Licznik restartów urządzenia
+uint64_t recordUptime = 0; // Rekordowy czas pracy urządzenia (w sekundach)
 
 // Timery
 unsigned long lastCheckTime = 0;
@@ -131,6 +133,7 @@ void loadSettings() {
     preferences.putBool("inv", false);
     preferences.putInt("mode", 0);
     preferences.putUInt("boots", 0); // Zainicjuj licznik bootowań
+    preferences.putULong64("recUpt", 0); // Zainicjuj rekord uptime
   }
 
   // Odczytaj ustawienia (istniejące lub domyślne po formacie)
@@ -144,6 +147,7 @@ void loadSettings() {
   // Inkrementacja i zapis licznika bootowań
   bootCount = preferences.getUInt("boots", 0) + 1;
   preferences.putUInt("boots", bootCount);
+  recordUptime = preferences.getULong64("recUpt", 0);
   if (Serial) Serial.printf("Boot #%" PRIu32 "\n", bootCount);
 
   // Odtwarzanie czasu po restarcie (w przypadku braku dostępu do serwera NTP)
@@ -160,11 +164,15 @@ void loadSettings() {
 
 void safeRestart() {
   time_t now = time(nullptr);
+  preferences.begin("astro", false);
   if (now > 1000000000l) {
-    preferences.begin("astro", false);
     preferences.putLong64("lastTime", (int64_t)now);
-    preferences.end();
   }
+  uint64_t currentUptime = esp_timer_get_time() / 1000000ULL;
+  if (currentUptime > recordUptime) {
+    preferences.putULong64("recUpt", currentUptime);
+  }
+  preferences.end();
   ESP.restart();
 }
 
@@ -237,6 +245,26 @@ void updateLED() {
   }
 }
 
+// --- Funkcja pomocnicza do formatowania uptime ---
+void formatUptime(uint64_t uptime_sec, char* buf, size_t bufSize) {
+  int u_years = uptime_sec / 31536000ULL; // 365 dni
+  int u_months = (uptime_sec % 31536000ULL) / 2592000ULL; // 30 dni
+  int u_days = (uptime_sec % 2592000ULL) / 86400ULL;
+  int u_hours = (uptime_sec % 86400ULL) / 3600ULL;
+  int u_mins = (uptime_sec % 3600ULL) / 60ULL;
+  int u_secs = uptime_sec % 60ULL;
+
+  if (u_years > 0) {
+    snprintf(buf, bufSize, "%d lat, %d mies., %d dni, %d godz., %d min., %d sek.", u_years, u_months, u_days, u_hours, u_mins, u_secs);
+  } else if (u_months > 0) {
+    snprintf(buf, bufSize, "%d mies., %d dni, %d godz., %d min., %d sek.", u_months, u_days, u_hours, u_mins, u_secs);
+  } else if (u_days > 0) {
+    snprintf(buf, bufSize, "%d dni, %d godz., %d min., %d sek.", u_days, u_hours, u_mins, u_secs);
+  } else {
+    snprintf(buf, bufSize, "%d godz., %d min., %d sek.", u_hours, u_mins, u_secs);
+  }
+}
+
 void handleRoot() {
   // --- Pre-kalkulacja wszystkich dynamicznych wartości, aby uniknąć alokacji String w pętli ---
   char lat_str[10], lng_str[10], osr_str[5], oss_str[5];
@@ -281,6 +309,14 @@ void handleRoot() {
   
   char version_buf[64];
   snprintf(version_buf, sizeof(version_buf), "%s.%d (%s %s)", APP_VERSION, BUILD_NUMBER, __DATE__, __TIME__);
+
+  char uptime_str[128];
+  uint64_t currentUptime = esp_timer_get_time() / 1000000ULL;
+  formatUptime(currentUptime, uptime_str, sizeof(uptime_str));
+
+  char rec_uptime_str[128];
+  uint64_t displayRecUptime = (currentUptime > recordUptime) ? currentUptime : recordUptime;
+  formatUptime(displayRecUptime, rec_uptime_str, sizeof(rec_uptime_str));
 
   // --- Wysyłanie odpowiedzi w kawałkach (chunked) w celu oszczędzania RAM ---
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
@@ -337,6 +373,10 @@ void handleRoot() {
       }
     } else if (strcmp(name_buf, "VERSION") == 0) {
       server.sendContent(version_buf);
+    } else if (strcmp(name_buf, "UPTIME") == 0) {
+      server.sendContent(uptime_str);
+    } else if (strcmp(name_buf, "REC_UPTIME") == 0) {
+      server.sendContent(rec_uptime_str);
     } else {
       // Nieznany placeholder, wyślij go dosłownie
       server.sendContent_P(placeholder_start, (placeholder_end - placeholder_start) + 2);
@@ -421,10 +461,12 @@ void setupWebServer() {
 
   // Endpoint API do zdalnej diagnostyki
   server.on("/api/status", HTTP_GET, [](){
+    uint64_t currentUptime = esp_timer_get_time() / 1000000ULL;
+    uint64_t displayRecUptime = (currentUptime > recordUptime) ? currentUptime : recordUptime;
     char buf[256];
     snprintf(buf, sizeof(buf),
-        "{\"heap\":%u,\"uptime\":%lu,\"boots\":%" PRIu32 ",\"wifi_connected\":%d,\"time_synced\":%d,\"mode\":%d}",
-        ESP.getFreeHeap(), millis()/1000, bootCount,
+        "{\"heap\":%u,\"uptime\":%" PRIu64 ",\"record_uptime\":%" PRIu64 ",\"boots\":%" PRIu32 ",\"wifi_connected\":%d,\"time_synced\":%d,\"mode\":%d}",
+        ESP.getFreeHeap(), currentUptime, displayRecUptime, bootCount,
         WiFi.status() == WL_CONNECTED,
         time(nullptr) > 1000000000l,
         currentMode);
@@ -635,6 +677,13 @@ void loop() {
         }
         // Zawsze zapisuj czas, gdy następuje jakikolwiek zapis do NVS
         preferences.putLong64("lastTime", (int64_t)now);
+        
+        uint64_t currentUptime = esp_timer_get_time() / 1000000ULL;
+        if (currentUptime > recordUptime) {
+          recordUptime = currentUptime;
+          preferences.putULong64("recUpt", recordUptime);
+        }
+        
         preferences.end();
         lastSaveTime = cm; // Zresetuj timer zapisu okresowego
         if (Serial) Serial.println("Zakończono zapis do NVS.");

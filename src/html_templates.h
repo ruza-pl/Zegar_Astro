@@ -94,8 +94,8 @@ a{color:inherit;text-decoration:none;}
 .form-row{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;}
 .fg{display:flex;flex-direction:column;gap:5px;}
 .fg label{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.1em;color:var(--tm);}
-input[type="number"],input[type="text"]{background:var(--s2);border:1px solid var(--bd);border-radius:var(--r6);padding:10px 12px;color:var(--t);font-family:var(--mono);font-size:13px;width:100%;transition:border-color .2s;}
-input[type="number"]:focus,input[type="text"]:focus{outline:none;border-color:rgba(74,158,255,.4);}
+input[type="number"],input[type="text"],input[type="password"]{background:var(--s2);border:1px solid var(--bd);border-radius:var(--r6);padding:10px 12px;color:var(--t);font-family:var(--mono);font-size:13px;width:100%;transition:border-color .2s;}
+input[type="number"]:focus,input[type="text"]:focus,input[type="password"]:focus{outline:none;border-color:rgba(74,158,255,.4);}
 input[type="text"][readonly]{color:var(--tm);cursor:default;}
 .inv-row{display:flex;align-items:center;gap:10px;padding:14px 0;border-top:1px solid var(--bd);margin-top:6px;}
 .inv-row span{font-size:13px;color:var(--t);}
@@ -132,6 +132,10 @@ footer{border-top:1px solid var(--bd);padding:22px 16px;text-align:center;color:
     <div class="srow">
       <span class="srow-lbl">Stan wyjścia</span>
       <span class="pin-pill"><span class="pin-dot" id="pd"></span><span id="pst">{{PIN_STATE}}</span></span>
+    </div>
+    <div class="srow">
+      <span class="srow-lbl">Sygnał Wi-Fi</span>
+      <span class="badge" style="background:var(--s2);color:var(--t);border:1px solid var(--bd);">{{WIFI_RSSI}}</span>
     </div>
     <div class="time-grid">
       <div class="time-box">
@@ -170,6 +174,28 @@ footer{border-top:1px solid var(--bd);padding:22px 16px;text-align:center;color:
         <label for="inv"><span>Inwersja &mdash; praca w dzień zamiast w nocy</span></label>
       </div>
       <input type="submit" value="Zapisz ustawienia" class="btn btn-save">
+    </form>
+  </div>
+
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;">
+      <div class="card-title" style="margin-bottom:0;">Konfiguracja MQTT</div>
+      <span class="pin-pill" style="font-size:10px;padding:4px 9px;"><span class="pin-dot {{MQTT_STATUS_CLASS}}"></span><span>{{MQTT_STATUS_TEXT}}</span></span>
+    </div>
+    <form action="/save_mqtt" method="POST">
+      <div class="inv-row" style="margin-top:0; border-top:none; margin-bottom:12px; padding:0 0 14px 0; border-bottom:1px solid var(--bd);">
+        <input type="checkbox" name="mqtt_en" id="mqtt_en" {{MQTT_EN}}>
+        <label for="mqtt_en"><span>Włącz integrację z Home Assistant</span></label>
+      </div>
+      <div class="form-row">
+        <div class="fg"><label>Serwer</label><input type="text" name="mqtt_srv" value="{{MQTT_SRV}}"></div>
+        <div class="fg"><label>Port</label><input type="number" name="mqtt_prt" value="{{MQTT_PRT}}"></div>
+      </div>
+      <div class="form-row">
+        <div class="fg"><label>Użytkownik</label><input type="text" name="mqtt_usr" value="{{MQTT_USR}}"></div>
+        <div class="fg"><label>Hasło</label><input type="password" name="mqtt_pwd" value="{{MQTT_PWD}}"></div>
+      </div>
+      <input type="submit" value="Zapisz ustawienia MQTT" class="btn btn-save" style="margin-top:6px;">
     </form>
   </div>
 

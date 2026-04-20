@@ -13,6 +13,7 @@
 #include <Update.h> // Dodano do obsługi OTA
 #include <esp_timer.h> // Do precyzyjnego liczenia uptime (odporne na przepełnienie po 49 dniach)
 #include <inttypes.h> // Do przenośnego formatowania uint32_t
+#include <PubSubClient.h> // Do obsługi MQTT
 #include "html_templates.h"
 
 // --- BEZPIECZEŃSTWO ---
@@ -53,6 +54,26 @@ bool g_timeIsFromNVS = false; // Flaga informująca, czy czas został przywróco
 uint32_t bootCount = 0; // Licznik restartów urządzenia
 uint64_t recordUptime = 0; // Rekordowy czas pracy urządzenia (w sekundach)
 
+// Zmienne MQTT
+bool mqtt_enabled = false;
+char mqtt_server[40] = "";
+char mqtt_port[6] = "1883";
+char mqtt_user[32] = "";
+char mqtt_pass[32] = "";
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+unsigned long lastMqttReconnectAttempt = 0;
+
+// Dynamiczne tematy MQTT (generowane w setup() na podstawie MAC)
+String mqttStateTopic;
+String mqttModeStateTopic;
+String mqttModeCmdTopic;
+String mqttSunriseTopic;
+String mqttSunsetTopic;
+String mqttUptimeTopic;
+String mqttAvailabilityTopic;
+String mqttRssiTopic;
+
 // Timery
 unsigned long lastCheckTime = 0;
 const unsigned long checkInterval = 60000;
@@ -78,9 +99,11 @@ void loadSettings();
 void updateRelayState();
 void updateLED();
 void handleRoot();
-void setMode(int mode);
+void changeMode(int mode);
 void setupWebServer();
 void safeRestart();
+void publishMqttState();
+void handleMQTT();
 
 // Funkcja wywoływana przez Ticker w tle (dla 5Hz)
 void tick() {
@@ -150,6 +173,17 @@ void loadSettings() {
   recordUptime = preferences.getULong64("recUpt", 0);
   if (Serial) Serial.printf("Boot #%" PRIu32 "\n", bootCount);
 
+  // Odczyt ustawień MQTT
+  mqtt_enabled = preferences.getBool("mqtt_en", false);
+  String srv = preferences.getString("mqtt_srv", "");
+  String prt = preferences.getString("mqtt_prt", "1883");
+  String usr = preferences.getString("mqtt_usr", "");
+  String pwd = preferences.getString("mqtt_pwd", "");
+  strncpy(mqtt_server, srv.c_str(), sizeof(mqtt_server));
+  strncpy(mqtt_port, prt.c_str(), sizeof(mqtt_port));
+  strncpy(mqtt_user, usr.c_str(), sizeof(mqtt_user));
+  strncpy(mqtt_pass, pwd.c_str(), sizeof(mqtt_pass));
+
   // Odtwarzanie czasu po restarcie (w przypadku braku dostępu do serwera NTP)
   int64_t lastTime = preferences.getLong64("lastTime", 0);
   if (time(nullptr) < 1000000000l && lastTime > 1000000000l) {
@@ -173,6 +207,12 @@ void safeRestart() {
     preferences.putULong64("recUpt", currentUptime);
   }
   preferences.end();
+  
+  if (mqttClient.connected()) {
+    mqttClient.publish(mqttAvailabilityTopic.c_str(), "offline", true);
+    mqttClient.disconnect();
+    delay(50);
+  }
   ESP.restart();
 }
 
@@ -210,7 +250,134 @@ void updateRelayState() {
   if (desiredState != lastCalculatedOutputState) {
     digitalWrite(OUTPUT_PIN, desiredState);
     lastCalculatedOutputState = desiredState;
+    publishMqttState(); // Rozgłoś nowy stan do HA
     // Nie ustawiamy `settingsDirty`, aby nie zapisywać do NVS przy każdej zmianie stanu przekaźnika
+  }
+}
+
+// --- OBSŁUGA MQTT i HA AUTO-DISCOVERY ---
+void publishMqttState() {
+  if (!mqttClient.connected()) return;
+  // Publikuj stan fizyczny przekaźnika
+  mqttClient.publish(mqttStateTopic.c_str(), digitalRead(OUTPUT_PIN) == HIGH ? "ON" : "OFF", true);
+  
+  // Publikuj aktualny tryb pracy (dla HA Select)
+  const char* modeStr = "AUTO";
+  if (currentMode == 1) modeStr = "ON";
+  else if (currentMode == 2) modeStr = "OFF";
+  mqttClient.publish(mqttModeStateTopic.c_str(), modeStr, true);
+
+  // Publikuj Czas wschodu i zachodu
+  if (currentSunrise >= 0 && currentSunset >= 0 && time(nullptr) > 1000000000l) {
+    char timeBuf[10];
+    time_t now = time(nullptr);
+    struct tm tinfo_local;
+    struct tm utc_tm;
+    localtime_r(&now, &tinfo_local);
+    gmtime_r(&now, &utc_tm);
+    int tz_offset = difftime(mktime(&tinfo_local), mktime(&utc_tm)) / 60;
+
+    int sr = (currentSunrise + tz_offset) % 1440; if (sr < 0) sr += 1440;
+    int ss = (currentSunset + tz_offset) % 1440; if (ss < 0) ss += 1440;
+
+    snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d", sr / 60, sr % 60);
+    mqttClient.publish(mqttSunriseTopic.c_str(), timeBuf, true);
+
+    snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d", ss / 60, ss % 60);
+    mqttClient.publish(mqttSunsetTopic.c_str(), timeBuf, true);
+  }
+
+  // Publikuj Uptime (w sekundach)
+  uint64_t uptimeSec = esp_timer_get_time() / 1000000ULL;
+  char upBuf[32];
+  snprintf(upBuf, sizeof(upBuf), "%" PRIu64, uptimeSec);
+  mqttClient.publish(mqttUptimeTopic.c_str(), upBuf, true);
+
+  // Publikuj RSSI
+  char rssiBuf[16];
+  snprintf(rssiBuf, sizeof(rssiBuf), "%d", WiFi.RSSI());
+  mqttClient.publish(mqttRssiTopic.c_str(), rssiBuf, true);
+}
+
+void publishAutoDiscovery() {
+  char buffer[800];
+  String mac = String(ESP.getEfuseMac(), HEX);
+  String dev = "\"device\":{\"identifiers\":[\"" + mac + "\"],\"name\":\"Zegar Astro\",\"model\":\"Zegar Astro ESP32-C3\",\"manufacturer\":\"PR\"}";
+  
+  // 1. Zgłoszenie encji Binary Sensor (Status Przekaźnika)
+  snprintf(buffer, sizeof(buffer),
+    "{\"name\":\"Przekaźnik\",\"state_topic\":\"%s\",\"availability_topic\":\"%s\",\"unique_id\":\"%s_relay\",%s}",
+    mqttStateTopic.c_str(), mqttAvailabilityTopic.c_str(), mac.c_str(), dev.c_str()
+  );
+  mqttClient.publish(("homeassistant/binary_sensor/astro_" + mac + "/state/config").c_str(), buffer, true);
+
+  // 2. Zgłoszenie encji Select (Tryb pracy)
+  snprintf(buffer, sizeof(buffer),
+    "{\"name\":\"Tryb Pracy\",\"state_topic\":\"%s\",\"command_topic\":\"%s\",\"availability_topic\":\"%s\",\"options\":[\"AUTO\",\"ON\",\"OFF\"],\"unique_id\":\"%s_mode\",\"icon\":\"mdi:cog-sync\",%s}",
+    mqttModeStateTopic.c_str(), mqttModeCmdTopic.c_str(), mqttAvailabilityTopic.c_str(), mac.c_str(), dev.c_str()
+  );
+  mqttClient.publish(("homeassistant/select/astro_" + mac + "/mode/config").c_str(), buffer, true);
+
+  // 3. Wschód Słońca (Sensor)
+  snprintf(buffer, sizeof(buffer),
+    "{\"name\":\"Wschód Słońca\",\"state_topic\":\"%s\",\"availability_topic\":\"%s\",\"unique_id\":\"%s_sr\",\"icon\":\"mdi:weather-sunset-up\",%s}",
+    mqttSunriseTopic.c_str(), mqttAvailabilityTopic.c_str(), mac.c_str(), dev.c_str()
+  );
+  mqttClient.publish(("homeassistant/sensor/astro_" + mac + "/sunrise/config").c_str(), buffer, true);
+
+  // 4. Zachód Słońca (Sensor)
+  snprintf(buffer, sizeof(buffer),
+    "{\"name\":\"Zachód Słońca\",\"state_topic\":\"%s\",\"availability_topic\":\"%s\",\"unique_id\":\"%s_ss\",\"icon\":\"mdi:weather-sunset-down\",%s}",
+    mqttSunsetTopic.c_str(), mqttAvailabilityTopic.c_str(), mac.c_str(), dev.c_str()
+  );
+  mqttClient.publish(("homeassistant/sensor/astro_" + mac + "/sunset/config").c_str(), buffer, true);
+
+  // 5. Uptime (Sensor)
+  snprintf(buffer, sizeof(buffer),
+    "{\"name\":\"Czas Pracy\",\"state_topic\":\"%s\",\"availability_topic\":\"%s\",\"unique_id\":\"%s_up\",\"device_class\":\"duration\",\"unit_of_measurement\":\"s\",%s}",
+    mqttUptimeTopic.c_str(), mqttAvailabilityTopic.c_str(), mac.c_str(), dev.c_str()
+  );
+  mqttClient.publish(("homeassistant/sensor/astro_" + mac + "/uptime/config").c_str(), buffer, true);
+
+  // 6. RSSI (Sensor diagnostyczny)
+  snprintf(buffer, sizeof(buffer),
+    "{\"name\":\"Sygnał Wi-Fi\",\"state_topic\":\"%s\",\"availability_topic\":\"%s\",\"unique_id\":\"%s_rssi\",\"device_class\":\"signal_strength\",\"unit_of_measurement\":\"dBm\",\"entity_category\":\"diagnostic\",%s}",
+    mqttRssiTopic.c_str(), mqttAvailabilityTopic.c_str(), mac.c_str(), dev.c_str()
+  );
+  mqttClient.publish(("homeassistant/sensor/astro_" + mac + "/rssi/config").c_str(), buffer, true);
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String msg;
+  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+  
+  if (String(topic) == mqttModeCmdTopic) {
+    if (msg == "AUTO") changeMode(0);
+    else if (msg == "ON") changeMode(1);
+    else if (msg == "OFF") changeMode(2);
+  }
+}
+
+void handleMQTT() {
+  if (!mqtt_enabled || mqtt_server[0] == '\0') return; // MQTT wyłączone lub nieskonfigurowane
+  
+  if (!mqttClient.connected()) {
+    if (millis() - lastMqttReconnectAttempt > 5000) {
+      lastMqttReconnectAttempt = millis();
+      if (Serial) Serial.println("Próba połączenia z MQTT...");
+      
+      String clientId = "ZegarAstro-" + String(ESP.getEfuseMac(), HEX);
+      // Konfiguracja LWT w przypadku utraty zasilania/połączenia
+      if (mqttClient.connect(clientId.c_str(), mqtt_user, mqtt_pass, mqttAvailabilityTopic.c_str(), 0, true, "offline")) {
+        if (Serial) Serial.println("Połączono z MQTT");
+        publishAutoDiscovery();
+        mqttClient.subscribe(mqttModeCmdTopic.c_str());
+        publishMqttState();
+        mqttClient.publish(mqttAvailabilityTopic.c_str(), "online", true); // Raportuj powrót online
+      }
+    }
+  } else {
+    mqttClient.loop();
   }
 }
 
@@ -318,6 +485,17 @@ void handleRoot() {
   uint64_t displayRecUptime = (currentUptime > recordUptime) ? currentUptime : recordUptime;
   formatUptime(displayRecUptime, rec_uptime_str, sizeof(rec_uptime_str));
 
+  char rssi_str[16];
+  if (WiFi.status() == WL_CONNECTED) {
+    snprintf(rssi_str, sizeof(rssi_str), "%d dBm", WiFi.RSSI());
+  } else {
+    strcpy(rssi_str, "Brak");
+  }
+
+  const char* mqtt_en_str = mqtt_enabled ? "checked" : "";
+  const char* mqtt_stat_cls = (mqtt_enabled && mqttClient.connected()) ? "on" : "";
+  const char* mqtt_stat_txt = !mqtt_enabled ? "WYŁĄCZONE" : (mqttClient.connected() ? "POŁĄCZONO" : "ROZŁĄCZONO");
+
   // --- Wysyłanie odpowiedzi w kawałkach (chunked) w celu oszczędzania RAM ---
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/html", "");
@@ -373,10 +551,26 @@ void handleRoot() {
       }
     } else if (strcmp(name_buf, "VERSION") == 0) {
       server.sendContent(version_buf);
+    } else if (strcmp(name_buf, "WIFI_RSSI") == 0) {
+      server.sendContent(rssi_str);
     } else if (strcmp(name_buf, "UPTIME") == 0) {
       server.sendContent(uptime_str);
     } else if (strcmp(name_buf, "REC_UPTIME") == 0) {
       server.sendContent(rec_uptime_str);
+    } else if (strcmp(name_buf, "MQTT_EN") == 0) {
+      if (mqtt_en_str[0] != '\0') server.sendContent(mqtt_en_str);
+    } else if (strcmp(name_buf, "MQTT_STATUS_CLASS") == 0) {
+      if (mqtt_stat_cls[0] != '\0') server.sendContent(mqtt_stat_cls);
+    } else if (strcmp(name_buf, "MQTT_STATUS_TEXT") == 0) {
+      server.sendContent(mqtt_stat_txt);
+    } else if (strcmp(name_buf, "MQTT_SRV") == 0) {
+      if (mqtt_server[0] != '\0') server.sendContent(mqtt_server);
+    } else if (strcmp(name_buf, "MQTT_PRT") == 0) {
+      if (mqtt_port[0] != '\0') server.sendContent(mqtt_port);
+    } else if (strcmp(name_buf, "MQTT_USR") == 0) {
+      if (mqtt_user[0] != '\0') server.sendContent(mqtt_user);
+    } else if (strcmp(name_buf, "MQTT_PWD") == 0) {
+      if (mqtt_pass[0] != '\0') server.sendContent(mqtt_pass);
     } else {
       // Nieznany placeholder, wyślij go dosłownie
       server.sendContent_P(placeholder_start, (placeholder_end - placeholder_start) + 2);
@@ -393,14 +587,13 @@ void handleRoot() {
   server.sendContent(""); // Zakończ odpowiedź
 }
 
-void setMode(int m) {
+void changeMode(int m) {
   if (currentMode != m) {
     currentMode = m;
     settingsDirty = true; // Oznacz ustawienia jako "brudne", ale nie zapisuj od razu
+    publishMqttState();
   }
   updateRelayState();
-  server.sendHeader("Location", "/");
-  server.send(303);
 }
 
 void setupWebServer() {
@@ -427,9 +620,35 @@ void setupWebServer() {
     server.sendHeader("Location", "/"); server.send(303);
   });
 
-  server.on("/api/auto", HTTP_GET, [](){ setMode(0); });
-  server.on("/api/on", HTTP_GET, [](){ setMode(1); });
-  server.on("/api/off", HTTP_GET, [](){ setMode(2); });
+  server.on("/save_mqtt", HTTP_POST, [](){
+    mqtt_enabled = server.hasArg("mqtt_en");
+    strncpy(mqtt_server, server.arg("mqtt_srv").c_str(), sizeof(mqtt_server) - 1);
+    mqtt_server[sizeof(mqtt_server) - 1] = '\0';
+    strncpy(mqtt_port, server.arg("mqtt_prt").c_str(), sizeof(mqtt_port) - 1);
+    mqtt_port[sizeof(mqtt_port) - 1] = '\0';
+    strncpy(mqtt_user, server.arg("mqtt_usr").c_str(), sizeof(mqtt_user) - 1);
+    mqtt_user[sizeof(mqtt_user) - 1] = '\0';
+    strncpy(mqtt_pass, server.arg("mqtt_pwd").c_str(), sizeof(mqtt_pass) - 1);
+    mqtt_pass[sizeof(mqtt_pass) - 1] = '\0';
+
+    preferences.begin("astro", false);
+    preferences.putBool("mqtt_en", mqtt_enabled);
+    preferences.putString("mqtt_srv", mqtt_server);
+    preferences.putString("mqtt_prt", mqtt_port);
+    preferences.putString("mqtt_usr", mqtt_user);
+    preferences.putString("mqtt_pwd", mqtt_pass);
+    preferences.end();
+
+    if (mqttClient.connected()) mqttClient.disconnect();
+    // Jeśli ustawiono adres serwera i włączono MQTT, nadpisz i spróbuj połączyć (handleMQTT zrobi resztę)
+    if (mqtt_enabled && mqtt_server[0] != '\0') mqttClient.setServer(mqtt_server, atoi(mqtt_port));
+
+    server.sendHeader("Location", "/"); server.send(303);
+  });
+
+  server.on("/api/auto", HTTP_GET, [](){ changeMode(0); server.sendHeader("Location", "/"); server.send(303); });
+  server.on("/api/on", HTTP_GET, [](){ changeMode(1); server.sendHeader("Location", "/"); server.send(303); });
+  server.on("/api/off", HTTP_GET, [](){ changeMode(2); server.sendHeader("Location", "/"); server.send(303); });
   server.on("/api/resetwifi", HTTP_GET, [](){
     server.send(200, "text/plain", "Reset WiFi...");
     delay(500); WiFiManager wm; wm.resetSettings(); safeRestart();
@@ -465,9 +684,11 @@ void setupWebServer() {
     uint64_t displayRecUptime = (currentUptime > recordUptime) ? currentUptime : recordUptime;
     char buf[256];
     snprintf(buf, sizeof(buf),
-        "{\"heap\":%u,\"uptime\":%" PRIu64 ",\"record_uptime\":%" PRIu64 ",\"boots\":%" PRIu32 ",\"wifi_connected\":%d,\"time_synced\":%d,\"mode\":%d}",
+        "{\"heap\":%u,\"uptime\":%" PRIu64 ",\"record_uptime\":%" PRIu64 ",\"boots\":%" PRIu32 ",\"wifi_connected\":%d,\"rssi\":%d,\"mqtt_connected\":%d,\"time_synced\":%d,\"mode\":%d}",
         ESP.getFreeHeap(), currentUptime, displayRecUptime, bootCount,
         WiFi.status() == WL_CONNECTED,
+        WiFi.RSSI(),
+        mqttClient.connected(),
         time(nullptr) > 1000000000l,
         currentMode);
     server.send(200, "application/json", buf);
@@ -586,6 +807,20 @@ void setup() {
   unsigned long startSerial = millis();
   while (!Serial && millis() - startSerial < 3000) { delay(10); }
 
+  // Dynamiczna konfiguracja tematów MQTT dla HA Auto-Discovery
+  String mac = String(ESP.getEfuseMac(), HEX);
+  mqttStateTopic = "zegar_astro/" + mac + "/state";
+  mqttModeStateTopic = "zegar_astro/" + mac + "/mode/state";
+  mqttModeCmdTopic = "zegar_astro/" + mac + "/mode/cmd";
+  mqttSunriseTopic = "zegar_astro/" + mac + "/sunrise";
+  mqttSunsetTopic = "zegar_astro/" + mac + "/sunset";
+  mqttUptimeTopic = "zegar_astro/" + mac + "/uptime";
+  mqttAvailabilityTopic = "zegar_astro/" + mac + "/availability";
+  mqttRssiTopic = "zegar_astro/" + mac + "/rssi";
+
+  // Zwiększenie bufora MQTT musi być wykonane ZAWSZE na starcie! (Dla Auto-Discovery 256 bajtów to za mało)
+  mqttClient.setBufferSize(1024);
+
   loadSettings();
 
   WiFiManager wm;
@@ -623,6 +858,11 @@ void setup() {
 
   updateRelayState();
 
+  if (mqtt_enabled && mqtt_server[0] != '\0') {
+    mqttClient.setServer(mqtt_server, atoi(mqtt_port));
+    mqttClient.setCallback(mqttCallback);
+  }
+
   // Inicjalizacja timerów długoterminowych po wszystkich operacjach startowych
   unsigned long startup_millis = millis(); // Capture current millis once
   lastCheckTime = startup_millis; // Initialize lastCheckTime
@@ -637,6 +877,10 @@ void loop() {
   server.handleClient();
   updateLED(); // Przejmuje obsługę po wyjściu z trybu konfiguracji
   
+  if (WiFi.status() == WL_CONNECTED) {
+    handleMQTT();
+  }
+
   unsigned long cm = millis();
 
   // --- NATYCHMIASTOWA REAKCJA NA SYNCHRONIZACJĘ CZASU ---
@@ -817,5 +1061,9 @@ void loop() {
     lastWiFiCheck = cm;
   }
 
-  if (cm - lastCheckTime > checkInterval) { updateRelayState(); lastCheckTime = cm; }
+  if (cm - lastCheckTime > checkInterval) { 
+    updateRelayState(); 
+    publishMqttState(); // Rozgłaszaj wszystkie stany regularnie (heartbeat + aktualizacja uptime)
+    lastCheckTime = cm; 
+  }
 }
